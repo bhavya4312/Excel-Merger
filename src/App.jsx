@@ -15,6 +15,9 @@ const App = () => {
   const [loadingText, setLoadingText] = useState("Initializing Python Environment...");
   const [logs, setLogs] = useState([]);
   
+  // Guard to prevent double-initialization in React Strict Mode
+  const pyodideInitializing = useRef(false);
+  
   // File State
   const [files, setFiles] = useState({
     file1: { file: null, label: null, name: null },
@@ -36,6 +39,10 @@ const App = () => {
   // 1. Initialize Pyodide (Python in Browser)
   // ----------------------------------------------------------------------
   useEffect(() => {
+    // If already initializing, skip to prevent double-loading
+    if (pyodideInitializing.current) return;
+    pyodideInitializing.current = true;
+
     const initPyodide = async () => {
       try {
         if (!window.loadPyodide) {
@@ -43,12 +50,20 @@ const App = () => {
         }
 
         const py = await window.loadPyodide();
-        setLoadingText("Installing Python libraries (pandas, openpyxl, xlrd)...");
+        setLoadingText("Setting up package manager (micropip)...");
         
-        // Load required packages
+        // Load micropip to install other packages
+        await py.loadPackage("micropip");
+        const micropip = py.pyimport("micropip");
+
+        setLoadingText("Installing Python libraries (pandas, openpyxl, xlrd)...");
+
+        // Load pandas (standard package)
         await py.loadPackage("pandas");
-        await py.loadPackage("openpyxl");
-        await py.loadPackage("xlrd");
+        
+        // Install xlrd and openpyxl using micropip (safer for dependencies)
+        await micropip.install("xlrd");
+        await micropip.install("openpyxl");
 
         setPyodide(py);
         setLoading(false);
@@ -56,6 +71,8 @@ const App = () => {
       } catch (err) {
         setError(`Failed to load Python: ${err.message}`);
         setLoading(false);
+        // Reset guard on error so user can potentially retry if they reload
+        pyodideInitializing.current = false;
       }
     };
 
@@ -342,6 +359,12 @@ print("Processing Complete.")
   // 4. Logic: Write Files -> Run Python -> Read Result
   // ----------------------------------------------------------------------
   const handleMerge = async () => {
+    // CRITICAL FIX: Guard against null pyodide instance
+    if (!pyodide) {
+      setError("Python environment is not ready. Please refresh the page or check your internet connection.");
+      return;
+    }
+
     setIsProcessing(true);
     setLogs([]);
     setError(null);
@@ -510,10 +533,11 @@ print("Processing Complete.")
               {!processedFileUrl ? (
                 <button
                   onClick={handleMerge}
-                  disabled={isProcessing}
+                  // FIX: Disable if pyodide is null (initialization failed)
+                  disabled={isProcessing || !pyodide}
                   className={`
                     flex items-center gap-2 px-8 py-3 rounded-full font-bold shadow-lg transition-all
-                    ${isProcessing 
+                    ${(isProcessing || !pyodide) 
                       ? 'bg-slate-300 text-slate-500 cursor-not-allowed' 
                       : 'bg-blue-600 hover:bg-blue-700 text-white hover:shadow-xl hover:-translate-y-1'
                     }

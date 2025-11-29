@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Upload, FileSpreadsheet, Download, RefreshCw, AlertCircle, CheckCircle } from 'lucide-react';
+import { Upload, FileSpreadsheet, Download, RefreshCw, AlertCircle, CheckCircle, ChevronDown, ChevronUp, Terminal } from 'lucide-react';
 
 /**
  * INSTRUCTIONS FOR DEPLOYMENT:
@@ -14,6 +14,7 @@ const App = () => {
   const [loading, setLoading] = useState(true);
   const [loadingText, setLoadingText] = useState("Initializing Python Environment...");
   const [logs, setLogs] = useState([]);
+  const [showLogs, setShowLogs] = useState(false); // New state for toggling logs
   
   // Guard to prevent double-initialization in React Strict Mode
   const pyodideInitializing = useRef(false);
@@ -369,6 +370,7 @@ print("Processing Complete.")
     setLogs([]);
     setError(null);
     setProcessedFileUrl(null);
+    setShowLogs(true); // Auto-open logs when processing starts (optional, can be removed)
 
     // Validation
     const { file1, file2 } = files;
@@ -431,6 +433,7 @@ print("Processing Complete.")
       console.error(err);
       setError(err.message);
       addLog(`Error: ${err.message}`);
+      setShowLogs(true); // Auto-open logs on error
     } finally {
       setIsProcessing(false);
     }
@@ -560,13 +563,26 @@ print("Processing Complete.")
               )}
             </div>
 
-            {/* Logs Console */}
-            <div className="bg-slate-900 rounded-lg p-4 font-mono text-xs text-green-400 h-48 overflow-y-auto">
-              <div className="text-slate-500 border-b border-slate-800 pb-2 mb-2">System Logs</div>
-              {logs.length === 0 && <span className="text-slate-600 italic">Waiting for input...</span>}
-              {logs.map((log, i) => (
-                <div key={i} className="mb-1">{log}</div>
-              ))}
+            {/* Logs Console Toggle */}
+            <div className="mt-4">
+              <button 
+                onClick={() => setShowLogs(!showLogs)}
+                className="flex items-center gap-2 text-xs font-semibold text-slate-500 hover:text-blue-600 transition-colors mx-auto"
+              >
+                <Terminal size={14} />
+                {showLogs ? "Hide System Logs" : "Show System Logs"}
+                {showLogs ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+              </button>
+
+              {showLogs && (
+                <div className="bg-slate-900 rounded-lg p-4 font-mono text-xs text-green-400 h-48 overflow-y-auto mt-2 shadow-inner">
+                  <div className="text-slate-500 border-b border-slate-800 pb-2 mb-2">System Logs</div>
+                  {logs.length === 0 && <span className="text-slate-600 italic">Waiting for input...</span>}
+                  {logs.map((log, i) => (
+                    <div key={i} className="mb-1">{log}</div>
+                  ))}
+                </div>
+              )}
             </div>
 
           </div>

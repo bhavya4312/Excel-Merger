@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Upload, FileSpreadsheet, Download, RefreshCw, AlertCircle, CheckCircle, ChevronDown, ChevronUp, Terminal, RotateCcw, FileText } from 'lucide-react';
-import jsPDF from 'jspdf';
-import autoTable from 'jspdf-autotable';
+import { jsPDF } from 'https://esm.sh/jspdf@2.5.1';
+import autoTable from 'https://esm.sh/jspdf-autotable@3.8.2';
 
 /**
  * INSTRUCTIONS FOR DEPLOYMENT:
@@ -102,11 +102,10 @@ const App = () => {
   };
 
   // ----------------------------------------------------------------------
-  // 3. JS PDF Generation
+  // 3. JS PDF Generation (Single Page Logic)
   // ----------------------------------------------------------------------
   const generatePDF = (data) => {
-    addLog("Generating formatted PDF document...");
-    const doc = new jsPDF('p', 'pt', 'a4');
+    addLog("Generating formatted single-page PDF document...");
     const body = [];
 
     data.forEach(row => {
@@ -142,7 +141,33 @@ const App = () => {
       }
     });
 
-    autoTable(doc, {
+    // ---------------------------------------------------------
+    // DYNAMIC HEIGHT CALCULATION:
+    // 1. Draw table on a fake, infinitely tall document
+    // ---------------------------------------------------------
+    const A4_WIDTH_PT = 595.28;
+    const dummyDoc = new jsPDF('p', 'pt', [A4_WIDTH_PT, 99999]); 
+    
+    autoTable(dummyDoc, {
+      body: body,
+      theme: 'grid',
+      styles: { fontSize: 8, cellPadding: 3, font: 'helvetica' },
+      margin: { top: 30, left: 30, right: 30 },
+      tableWidth: 'auto',
+    });
+
+    // 2. Extract exactly how tall the table ended up being
+    const totalContentHeight = dummyDoc.lastAutoTable.finalY + 30; // Add 30pt for bottom margin padding
+    // Make sure the document is at least A4 height (841.89pt) so it doesn't look weird if the table is tiny
+    const finalPageHeight = Math.max(841.89, totalContentHeight); 
+
+    // ---------------------------------------------------------
+    // FINAL PDF GENERATION:
+    // Create the actual document using the exactly measured height
+    // ---------------------------------------------------------
+    const finalDoc = new jsPDF('p', 'pt', [A4_WIDTH_PT, finalPageHeight]);
+
+    autoTable(finalDoc, {
       body: body,
       theme: 'grid',
       styles: { fontSize: 8, cellPadding: 3, textColor: [0, 0, 0], font: 'helvetica' },
@@ -150,7 +175,7 @@ const App = () => {
       tableWidth: 'auto',
     });
 
-    return doc;
+    return finalDoc;
   };
 
   // ----------------------------------------------------------------------

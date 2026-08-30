@@ -1,5 +1,6 @@
+/* eslint-disable no-undef */
 // Web Worker for isolated Pyodide WASM runtime
-import { loadPyodide } from 'https://cdn.jsdelivr.net/pyodide/v0.23.4/full/pyodide.mjs';
+importScripts('https://cdn.jsdelivr.net/pyodide/v0.23.4/full/pyodide.js');
 
 let pyodide = null;
 
@@ -15,7 +16,9 @@ self.onmessage = async (e) => {
       self.postMessage({ type: 'INIT_STEP', step: 0 });
 
       if (!pyodide) {
-        pyodide = await loadPyodide();
+        pyodide = await loadPyodide({
+          indexURL: 'https://cdn.jsdelivr.net/pyodide/v0.23.4/full/'
+        });
       }
       self.postMessage({ type: 'INIT_STEP', step: 1 });
 

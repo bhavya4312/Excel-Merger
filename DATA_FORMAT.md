@@ -80,7 +80,7 @@ Appears immediately after a party header if there's a recent receipt.
 ["Rcpt: 799.00 Dt.: 05-04-26 <11 Days>", None, None, None, None, None]
 ```
 
-**Pattern:** Column A starts with `Rcpt:`.
+**Pattern:** Column A starts with `Rcpt:`. Columns B–F are all `None`. These rows have no debit/credit data — the receipt info is entirely in the Column A text.
 
 #### 6. Transaction Rows
 
@@ -94,8 +94,11 @@ Individual invoice/bill entries under a party.
 **Key detail — Column D (BILL VALUE):**
 The debit and credit amounts are packed into a single string separated by whitespace, e.g., `"2920.00          0.00"`. The Python processing script splits this into separate Debit and Credit columns in the output.
 
+**Negative debit values:**
+Some rows have a negative debit value formatted as a single number, e.g., `"       -209.00"` (1 part, not 2). When this happens, the processing script flips it: sets Debit to `0.0` and puts the absolute value in the Credit column.
+
 - Asterisk (`*`) prefix on invoice numbers (e.g., `*RM-4498`) indicates overdue bills.
-- Column A sometimes contains `2` (meaning unclear — possibly a flag from MARG ERP).
+- Column A sometimes contains `2` (meaning unclear — possibly a flag from MARG ERP). This value is stripped during processing.
 - Column F is the number of overdue days.
 
 #### 7. Separator Row
@@ -108,11 +111,22 @@ An all-`None` row appears between each party block.
 
 #### 8. Footer (Last Row)
 
-An ad/promo line from MARG ERP software. Ignored during processing.
+An ad/promo line from MARG ERP software. Filtered out during processing.
 
 ```
 ["Digital Purchase | ERP Ordering | Healthcare QRCode on bills for extra earnings | Call MARG 7771012366,...", ...]
 ```
+
+### Parsing Edge Cases
+
+> **Separator rows reset party context:**
+> The parser resets `current_party_key = None` on separator rows (all-`None` rows). This prevents city subtotal rows (e.g., `[None, "KORBA", "", "", 508896, ""]`) and other non-transaction rows from leaking into the previous party's transaction list. Without this reset, any row appearing after a separator but before the next party header would be incorrectly attributed to the last party.
+
+> **`Rcpt:` rows and debit processing:**
+> Receipt rows have `None` in Column D and no bill value data. The parser correctly includes them in the output without attempting debit/credit conversion.
+
+> **Footer filtering:**
+> The MARG ERP footer/ad row (`"Digital Purchase | ERP Ordering..."`) is explicitly filtered out by checking if Column A starts with `"Digital Purchase"`.
 
 ---
 
@@ -166,7 +180,21 @@ Each matched party produces this block:
 | Column sub-headers (Type, Bill, etc.) | Light grey | `#F2F2F2` |
 | Outstanding Summary | Dark blue (white text) | `#4472C4` |
 
+### Number Formatting
+
+- **Indian comma grouping** is applied to all monetary amounts (Debit, Credit, Balance, party totals): e.g., `12,34,567.00` instead of `1234567.00`.
+- In Excel, the number format `#,##,##0.00` is applied to numeric cells in columns D (Debit), E (Credit), F (Balance), and G (party total).
+- The Outstanding Summary text uses formatted numbers: `Outstanding Summary | Medical: 6,34,391.00 | Surgical: 5,08,100.00 | Total: 11,42,491.00`.
+
+### Excel Output Details
+
+- **Sheet name:** "Outstanding Report" (not default "Sheet1")
+- **Output filename:** `Merged_Report_YYYY-MM-DD.xlsx` (includes the processing date)
+
 ### PDF Output
 
-The PDF mirrors the Excel layout and color scheme, rendered as a single continuous page using jsPDF + autoTable. The page height is dynamically calculated to fit all content without pagination.
-
+- The PDF mirrors the Excel layout and color scheme, rendered as a single continuous page using jsPDF + autoTable.
+- **Title:** "Outstanding Report — DD Mon YYYY" displayed at the top of the page.
+- The page height is dynamically calculated to fit all content without pagination.
+- Numeric values in Debit, Credit, and Balance columns use Indian comma grouping.
+- **Output filename:** `Merged_Report_YYYY-MM-DD.pdf`

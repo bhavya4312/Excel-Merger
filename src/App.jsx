@@ -1,7 +1,6 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { Upload, FileSpreadsheet, RefreshCw, AlertCircle, CheckCircle, ChevronDown, ChevronUp, Terminal, RotateCcw, FileText, AlertTriangle } from 'lucide-react';
-import { jsPDF } from 'jspdf';
-import autoTable from 'jspdf-autotable';
+import { Upload, FileSpreadsheet, RefreshCw, AlertCircle, CheckCircle, ChevronDown, ChevronUp, Terminal, RotateCcw, FileText, AlertTriangle, FolderArchive } from 'lucide-react';
+import { initPyodideWorker, autoDetectLabelWorker, runMergeWorker } from './pyodideClient';
 
 // ============================================================================
 // Constants (outside component — no re-creation on render)
@@ -69,26 +68,7 @@ const validateFile = (file) => {
   return null;
 };
 
-/** Auto-detect the file label by reading Row 1 via Pyodide */
-const autoDetectLabel = async (py, file) => {
-  const ext = file.name.split('.').pop().toLowerCase();
-  const tempName = `_detect_${Date.now()}.${ext}`;
-  const buffer = await file.arrayBuffer();
-  py.FS.writeFile(tempName, new Uint8Array(buffer));
-  try {
-    const engine = ext === 'xls' ? 'xlrd' : 'openpyxl';
-    const result = await py.runPythonAsync(`
-import pandas as pd
-_df = pd.read_excel("${tempName}", header=None, nrows=1, engine='${engine}')
-str(_df.iloc[0, 0]).strip()
-`);
-    if (result.includes('RAHUL MEDICAL')) return 'RAHUL MEDICAL & SURGICAL';
-    if (result.includes('RAHUL SURGICAL')) return 'RAHUL SURGICAL';
-    return null;
-  } finally {
-    try { py.FS.unlink(tempName); } catch { /* ignore cleanup errors */ }
-  }
-};
+
 
 /** Extract summary info from processed data for the preview panel */
 const extractPreviewInfo = (data) => {
@@ -100,15 +80,18 @@ const extractPreviewInfo = (data) => {
     const valA = String(row[0] || '').trim();
     const valB = String(row[1] || '').trim();
 
-    // Party header detection (same logic as PDF generator)
+    // Party header detection
     const isPartyHeader = (valA && !valB &&
       !valA.toLowerCase().startsWith("rcpt") &&
       !valA.startsWith("Outstanding Summary") &&
       !valA.startsWith("---") &&
+      !valA.startsWith("--") &&
+      valA !== "Bill" &&
       valA !== "Type");
 
     if (isPartyHeader) {
-      parties.push({ name: valA, total: Number(row[6]) || 0 });
+      const partyTotal = Number(row[5] !== "" && row[5] !== undefined ? row[5] : (row[6] || 0)) || 0;
+      parties.push({ name: valA, total: partyTotal });
     }
 
     // Parse the Outstanding Summary line for per-entity totals
@@ -124,13 +107,340 @@ const extractPreviewInfo = (data) => {
   return { parties, medicalTotal, surgicalTotal, grandTotal };
 };
 
+/** Sanitize filename for ZIP archive extraction across OS filesystems */
+const sanitizeFilename = (name) => {
+  return String(name || 'Customer')
+    .replace(/[<>:"/\\|?*]/g, '_')
+    .replace(/\s+/g, ' ')
+    .trim();
+};
+
+/** Group flat merged rows by individual party for card image generation */
+const groupRowsByParty = (data) => {
+  const parties = [];
+  let currentParty = null;
+  let currentSection = null;
+
+  (data || []).forEach((row) => {
+    const valA = String(row[0] || '').trim();
+    const valB = String(row[1] || '').trim();
+
+    // Party Header detection
+    const isPartyHeader = (valA && !valB &&
+      !valA.toLowerCase().startsWith("rcpt") &&
+      !valA.startsWith("Outstanding Summary") &&
+      !valA.startsWith("---") &&
+      !valA.startsWith("--") &&
+      valA !== "Bill" &&
+      valA !== "Type");
+
+    if (isPartyHeader) {
+      const partyTotal = Number(row[5] !== "" && row[5] !== undefined ? row[5] : (row[6] || 0)) || 0;
+      currentParty = {
+        displayName: valA,
+        totalAmount: partyTotal,
+        medicalTransactions: [],
+        surgicalTransactions: [],
+        medicalTotal: 0,
+        surgicalTotal: 0,
+      };
+      parties.push(currentParty);
+      currentSection = null;
+      return;
+    }
+
+    if (!currentParty) return;
+
+    if (valA.startsWith("--- Medical") || valA.startsWith("-- Medical")) {
+      currentSection = "medical";
+      return;
+    }
+    if (valA.startsWith("--- Surgical") || valA.startsWith("-- Surgical")) {
+      currentSection = "surgical";
+      return;
+    }
+    if (valA.startsWith("Outstanding Summary")) {
+      const medMatch = valA.match(/Medical:\s*([\d,.]+)/);
+      const surgMatch = valA.match(/Surgical:\s*([\d,.]+)/);
+      if (medMatch) currentParty.medicalTotal = parseFloat(medMatch[1].replace(/,/g, ''));
+      if (surgMatch) currentParty.surgicalTotal = parseFloat(surgMatch[1].replace(/,/g, ''));
+      currentSection = null;
+      return;
+    }
+    if (valA === "Type" || valA === "Bill" || valB === "Bill") {
+      return;
+    }
+
+    // Has valid transaction content
+    const hasData = row.some(cell => cell !== "" && cell !== null && cell !== undefined);
+    if (hasData && currentSection) {
+      if (currentSection === "medical") {
+        currentParty.medicalTransactions.push(row);
+      } else if (currentSection === "surgical") {
+        currentParty.surgicalTransactions.push(row);
+      }
+    }
+  });
+
+  return parties;
+};
+
+/** Render a single party's high-DPI card to a PNG Blob */
+const renderPartyCardCanvas = (party, formattedDate) => {
+  return new Promise((resolve) => {
+    const dpr = 2; // High-DPI 2x scale for sharp typography on mobile screens
+    const width = 880;
+    const padX = 24;
+    const padY = 24;
+    const contentWidth = width - padX * 2;
+
+    const headerHeight = 92;
+    const sectionGap = 16;
+    const bannerHeight = 28;
+    const tableHeaderHeight = 30;
+    const rowHeight = 28;
+    const summaryHeight = 38;
+
+    const medRows = party.medicalTransactions.length;
+    const surgRows = party.surgicalTransactions.length;
+
+    let tablesHeight = 0;
+    if (medRows > 0) {
+      tablesHeight += bannerHeight + tableHeaderHeight + (medRows * rowHeight) + sectionGap;
+    }
+    if (surgRows > 0) {
+      tablesHeight += bannerHeight + tableHeaderHeight + (surgRows * rowHeight) + sectionGap;
+    }
+
+    const totalHeight = padY + headerHeight + sectionGap + tablesHeight + summaryHeight + padY;
+
+    const canvas = document.createElement('canvas');
+    canvas.width = width * dpr;
+    canvas.height = totalHeight * dpr;
+
+    const ctx = canvas.getContext('2d');
+    ctx.scale(dpr, dpr);
+
+    // Background
+    ctx.fillStyle = '#FFFFFF';
+    ctx.fillRect(0, 0, width, totalHeight);
+
+    // Subtle card border
+    ctx.strokeStyle = '#E2E8F0';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(10, 10, width - 20, totalHeight - 20);
+
+    let y = padY;
+
+    // --- 1. Top Header Box ---
+    ctx.fillStyle = '#F8FAFC';
+    ctx.fillRect(padX, y, contentWidth, headerHeight);
+    ctx.strokeStyle = '#CBD5E1';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(padX, y, contentWidth, headerHeight);
+
+    // Top Badge & Date
+    ctx.fillStyle = '#1D4ED8';
+    ctx.font = 'bold 11px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+    ctx.textAlign = 'left';
+    ctx.fillText('OUTSTANDING STATEMENT', padX + 16, y + 22);
+
+    ctx.fillStyle = '#64748B';
+    ctx.font = '500 12px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+    ctx.textAlign = 'right';
+    ctx.fillText(`Statement Date: ${formattedDate}`, padX + contentWidth - 16, y + 22);
+
+    // Party Name & City
+    ctx.fillStyle = '#0F172A';
+    ctx.font = 'bold 18px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+    ctx.textAlign = 'left';
+    const partyNameText = party.displayName || 'Customer';
+    ctx.fillText(partyNameText, padX + 16, y + 50);
+
+    // Companies Subtitle
+    const hasMed = medRows > 0;
+    const hasSurg = surgRows > 0;
+    let companiesText = '';
+    if (hasMed && hasSurg) companiesText = 'Rahul Medical & Surgicals  •  Rahul Surgical';
+    else if (hasMed) companiesText = 'Rahul Medical & Surgicals';
+    else if (hasSurg) companiesText = 'Rahul Surgical';
+
+    ctx.fillStyle = '#475569';
+    ctx.font = '500 12px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+    ctx.fillText(companiesText, padX + 16, y + 72);
+
+    // Total Outstanding on Header Right
+    ctx.fillStyle = '#1E3A8A';
+    ctx.font = 'bold 20px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+    ctx.textAlign = 'right';
+    ctx.fillText(`₹${formatIndianNumber(party.totalAmount || 0)}`, padX + contentWidth - 16, y + 52);
+
+    ctx.fillStyle = '#64748B';
+    ctx.font = '500 11px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+    ctx.fillText('Total Outstanding', padX + contentWidth - 16, y + 70);
+    ctx.textAlign = 'left';
+
+    y += headerHeight + sectionGap;
+
+    // --- Table Column Layout (6 columns, Type removed) ---
+    const cols = [
+      { title: 'Bill', width: 0.20, align: 'left' },
+      { title: 'Date', width: 0.15, align: 'center' },
+      { title: 'Debit (₹)', width: 0.17, align: 'right' },
+      { title: 'Credit (₹)', width: 0.17, align: 'right' },
+      { title: 'Balance (₹)', width: 0.19, align: 'right' },
+      { title: 'Days', width: 0.12, align: 'center' },
+    ];
+
+    let curX = padX;
+    cols.forEach(col => {
+      col.x = curX;
+      col.colWidth = col.width * contentWidth;
+      curX += col.colWidth;
+    });
+
+    const drawTable = (sectionTitle, bannerBg, bannerTextColor, transactions) => {
+      // 1. Section Banner (BOLD and UPPERCASE)
+      ctx.fillStyle = bannerBg;
+      ctx.fillRect(padX, y, contentWidth, bannerHeight);
+      ctx.strokeStyle = '#94A3B8';
+      ctx.lineWidth = 0.5;
+      ctx.strokeRect(padX, y, contentWidth, bannerHeight);
+
+      ctx.fillStyle = bannerTextColor;
+      ctx.font = 'bold 13px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(sectionTitle, padX + contentWidth / 2, y + 19);
+
+      y += bannerHeight;
+
+      // 2. Table Column Headers
+      ctx.fillStyle = '#F1F5F9';
+      ctx.fillRect(padX, y, contentWidth, tableHeaderHeight);
+      ctx.strokeStyle = '#CBD5E1';
+      ctx.lineWidth = 0.5;
+      ctx.strokeRect(padX, y, contentWidth, tableHeaderHeight);
+
+      ctx.fillStyle = '#334155';
+      ctx.font = 'bold 12px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+
+      cols.forEach(col => {
+        let textX = col.x + 8;
+        if (col.align === 'center') textX = col.x + col.colWidth / 2;
+        if (col.align === 'right') textX = col.x + col.colWidth - 8;
+        ctx.textAlign = col.align;
+        ctx.fillText(col.title, textX, y + 19);
+      });
+
+      y += tableHeaderHeight;
+
+      // 3. Transactions Rows
+      transactions.forEach((tx, idx) => {
+        const isEven = idx % 2 === 0;
+        ctx.fillStyle = isEven ? '#FFFFFF' : '#F8FAFC';
+        ctx.fillRect(padX, y, contentWidth, rowHeight);
+        ctx.strokeStyle = '#E2E8F0';
+        ctx.lineWidth = 0.5;
+        ctx.strokeRect(padX, y, contentWidth, rowHeight);
+
+        const valA = String(tx[0] || '').trim();
+        const isRcpt = valA.toLowerCase().startsWith('rcpt');
+
+        if (isRcpt) {
+          ctx.fillStyle = '#EFF6FF';
+          ctx.fillRect(padX + 1, y + 1, contentWidth - 2, rowHeight - 2);
+          ctx.fillStyle = '#1D4ED8';
+          ctx.font = 'italic 12px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+          ctx.textAlign = 'left';
+          ctx.fillText(`📄  ${valA}`, padX + 12, y + 18);
+        } else {
+          const is6Col = tx.length === 6 || (tx[0] && tx[0] !== "");
+          const bill = String((is6Col ? tx[0] : tx[1]) || '').trim();
+          const date = String((is6Col ? tx[1] : tx[2]) || '').trim();
+          const rawDebit = is6Col ? tx[2] : tx[3];
+          const rawCredit = is6Col ? tx[3] : tx[4];
+          const rawBalance = is6Col ? tx[4] : tx[5];
+          const days = String((is6Col ? tx[5] : tx[6]) || '').trim();
+
+          const debitVal = rawDebit !== '' && rawDebit !== null && rawDebit !== undefined && !isNaN(rawDebit) ? Number(rawDebit) : null;
+          const creditVal = rawCredit !== '' && rawCredit !== null && rawCredit !== undefined && !isNaN(rawCredit) ? Number(rawCredit) : null;
+          const balanceVal = rawBalance !== '' && rawBalance !== null && rawBalance !== undefined && !isNaN(rawBalance) ? Number(rawBalance) : null;
+
+          // Bill
+          ctx.fillStyle = '#0F172A';
+          ctx.font = bill.startsWith('*') ? 'bold 12px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif' : '12px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+          ctx.textAlign = 'left';
+          ctx.fillText(bill, cols[0].x + 8, y + 18);
+
+          // Date
+          ctx.fillStyle = '#475569';
+          ctx.font = '12px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+          ctx.textAlign = 'center';
+          ctx.fillText(date, cols[1].x + cols[1].colWidth / 2, y + 18);
+
+          // Debit
+          ctx.fillStyle = '#0F172A';
+          ctx.textAlign = 'right';
+          ctx.fillText(debitVal !== null ? formatIndianNumber(debitVal) : '', cols[2].x + cols[2].colWidth - 8, y + 18);
+
+          // Credit
+          ctx.fillStyle = creditVal && creditVal > 0 ? '#15803D' : '#0F172A';
+          ctx.fillText(creditVal !== null ? formatIndianNumber(creditVal) : '', cols[3].x + cols[3].colWidth - 8, y + 18);
+
+          // Balance
+          ctx.fillStyle = '#0F172A';
+          ctx.font = 'bold 12px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+          ctx.fillText(balanceVal !== null ? formatIndianNumber(balanceVal) : '', cols[4].x + cols[4].colWidth - 8, y + 18);
+
+          // Days
+          ctx.fillStyle = '#64748B';
+          ctx.font = '12px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+          ctx.textAlign = 'center';
+          ctx.fillText(days, cols[5].x + cols[5].colWidth / 2, y + 18);
+        }
+
+        y += rowHeight;
+      });
+
+      y += sectionGap;
+    };
+
+    if (medRows > 0) {
+      drawTable('--- RAHUL MEDICAL & SURGICALS ---', '#C6E0B4', '#1B4D1B', party.medicalTransactions);
+    }
+    if (surgRows > 0) {
+      drawTable('--- RAHUL SURGICAL ---', '#F8CBAD', '#7C2D12', party.surgicalTransactions);
+    }
+
+    // --- 3. Summary Footer Bar ---
+    ctx.fillStyle = '#4472C4';
+    ctx.fillRect(padX, y, contentWidth, summaryHeight);
+    ctx.strokeStyle = '#2B579A';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(padX, y, contentWidth, summaryHeight);
+
+    ctx.fillStyle = '#FFFFFF';
+    ctx.font = 'bold 13px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+    ctx.textAlign = 'center';
+
+    const medStr = `Medical: ₹${formatIndianNumber(party.medicalTotal || 0)}`;
+    const surgStr = `Surgical: ₹${formatIndianNumber(party.surgicalTotal || 0)}`;
+    const totalStr = `Total: ₹${formatIndianNumber(party.totalAmount || 0)}`;
+    ctx.fillText(`Outstanding Summary   |   ${medStr}   |   ${surgStr}   |   ${totalStr}`, padX + contentWidth / 2, y + 23);
+
+    canvas.toBlob((blob) => {
+      resolve(blob);
+    }, 'image/png');
+  });
+};
+
 
 // ============================================================================
 // App Component
 // ============================================================================
 const App = () => {
   // --- Application State ---
-  const [pyodide, setPyodide] = useState(null);
+  const [isWorkerReady, setIsWorkerReady] = useState(false);
   const [loading, setLoading] = useState(true);
   const [loadingStep, setLoadingStep] = useState(0);
   const [initError, setInitError] = useState(null);
@@ -158,6 +468,11 @@ const App = () => {
   const [previewData, setPreviewData] = useState(null);
   const [showPreview, setShowPreview] = useState(true);
 
+  // --- Raw Merged Data & ZIP Export State ---
+  const [parsedRows, setParsedRows] = useState(null);
+  const [isGeneratingZip, setIsGeneratingZip] = useState(false);
+  const [zipProgress, setZipProgress] = useState({ current: 0, total: 0 });
+
   // --- Computed Values ---
   const currentStep = useMemo(() => {
     if (processedFileUrl) return 3;
@@ -166,7 +481,7 @@ const App = () => {
   }, [files, processedFileUrl]);
 
   // ----------------------------------------------------------------------
-  // 1. Initialize Pyodide (with progress steps and retry)
+  // 1. Initialize Pyodide via Background Web Worker
   // ----------------------------------------------------------------------
   const doInitPyodide = async () => {
     try {
@@ -174,25 +489,14 @@ const App = () => {
       setLoading(true);
       setLoadingStep(0);
 
-      if (!window.loadPyodide) {
-        throw new Error("Pyodide script not found. Please check your internet connection and refresh.");
-      }
+      await initPyodideWorker(
+        (step) => setLoadingStep(step),
+        (msg) => addLog(msg)
+      );
 
-      const py = await window.loadPyodide();
-      setLoadingStep(1);
-
-      await py.loadPackage("micropip");
-      const micropip = py.pyimport("micropip");
-      setLoadingStep(2);
-
-      await py.loadPackage("pandas");
-      await micropip.install("xlrd");
-      await micropip.install("openpyxl");
-      setLoadingStep(3);
-
-      setPyodide(py);
+      setIsWorkerReady(true);
       setLoading(false);
-      addLog("Python environment ready. Ready to process files.");
+      addLog("Python Web Worker ready. Ready to process files.");
     } catch (err) {
       setInitError(`Failed to load Python environment: ${err.message}`);
       setLoading(false);
@@ -241,10 +545,10 @@ const App = () => {
       [fileKey]: { ...prev[fileKey], file: uploadedFile, name: uploadedFile.name }
     }));
 
-    // Auto-detect label via Pyodide
-    if (pyodide) {
+    // Auto-detect label via Web Worker
+    if (isWorkerReady) {
       try {
-        const detectedLabel = await autoDetectLabel(pyodide, uploadedFile);
+        const detectedLabel = await autoDetectLabelWorker(uploadedFile);
         if (detectedLabel) {
           setFiles(prev => ({
             ...prev,
@@ -304,6 +608,9 @@ const App = () => {
     setProcessedFileUrl(null);
     setProcessedPdfUrl(null);
     setPreviewData(null);
+    setParsedRows(null);
+    setIsGeneratingZip(false);
+    setZipProgress({ current: 0, total: 0 });
     setLogs([]);
     setError(null);
     setWarningCount(0);
@@ -313,90 +620,133 @@ const App = () => {
   };
 
   // ----------------------------------------------------------------------
-  // 3. PDF Generation (Single Page — preserved)
+  // 3. PDF Generation (Single Page — preserved, dynamically loaded)
   // ----------------------------------------------------------------------
-  const generatePDF = (data) => {
+  const generatePDF = async (data) => {
     addLog("Generating formatted single-page PDF document...");
+    const { jsPDF } = await import('jspdf');
+    const autoTableModule = await import('jspdf-autotable');
+    const autoTable = autoTableModule.default || autoTableModule;
+
     const body = [];
 
     data.forEach(row => {
       const valA = String(row[0] || '').trim();
       const valB = String(row[1] || '').trim();
 
-      // Handle empty spacing rows
-      if (row.every(c => c === "" || c === null)) {
-        body.push([{ content: '', colSpan: 7, styles: { minCellHeight: 15, fillColor: [255, 255, 255], lineWidth: 0 } }]);
+      // Handle empty spacing rows between parties
+      if (row.every(c => c === "" || c === null || c === undefined)) {
+        body.push([{ content: '', colSpan: 6, styles: { minCellHeight: 14, fillColor: [255, 255, 255], lineWidth: 0 } }]);
         return;
       }
 
-      const isPartyHeader = (valA && !valB && !valA.toLowerCase().startsWith("rcpt") && !valA.startsWith("Outstanding Summary") && !valA.startsWith("---") && valA !== "Type");
+      const isPartyHeader = (valA && !valB &&
+        !valA.toLowerCase().startsWith("rcpt") &&
+        !valA.startsWith("Outstanding Summary") &&
+        !valA.startsWith("---") &&
+        !valA.startsWith("--") &&
+        valA !== "Bill" &&
+        valA !== "Type");
 
       if (isPartyHeader) {
+        const partyTotal = row[5] !== "" && row[5] !== undefined ? row[5] : (row[6] || 0);
         body.push([
-          { content: valA, colSpan: 6, styles: { fillColor: [217, 225, 242], fontStyle: 'bold', halign: 'center', lineWidth: 0.5 } },
-          { content: formatIndianNumber(row[6]), styles: { fillColor: [217, 225, 242], fontStyle: 'bold', halign: 'right', lineWidth: 0.5 } }
+          { content: valA, colSpan: 5, styles: { fillColor: [217, 225, 242], fontStyle: 'bold', halign: 'center', lineWidth: 0.5, lineColor: [180, 195, 225] } },
+          { content: formatIndianNumber(partyTotal), styles: { fillColor: [217, 225, 242], fontStyle: 'bold', halign: 'right', lineWidth: 0.5, lineColor: [180, 195, 225] } }
         ]);
-      } else if (valA === "Type") {
-        body.push(row.map(cell => ({ content: String(cell), styles: { fillColor: [242, 242, 242], fontStyle: 'bold', halign: 'center', lineWidth: 0.5 } })));
-      } else if (valA.startsWith("---")) {
-        const fill = valA.includes("Medical") ? [198, 224, 180] : [248, 203, 173];
-        body.push([{ content: valA, colSpan: 7, styles: { fillColor: fill, fontStyle: 'bold', halign: 'center', lineWidth: 0.5 } }]);
+      } else if (valA === "Bill" || (valA === "Type" && valB === "Bill")) {
+        body.push([
+          { content: 'Bill', styles: { fillColor: [242, 242, 242], fontStyle: 'bold', halign: 'center', lineWidth: 0.5 } },
+          { content: 'Date', styles: { fillColor: [242, 242, 242], fontStyle: 'bold', halign: 'center', lineWidth: 0.5 } },
+          { content: 'Debit', styles: { fillColor: [242, 242, 242], fontStyle: 'bold', halign: 'center', lineWidth: 0.5 } },
+          { content: 'Credit', styles: { fillColor: [242, 242, 242], fontStyle: 'bold', halign: 'center', lineWidth: 0.5 } },
+          { content: 'Balance', styles: { fillColor: [242, 242, 242], fontStyle: 'bold', halign: 'center', lineWidth: 0.5 } },
+          { content: 'Days', styles: { fillColor: [242, 242, 242], fontStyle: 'bold', halign: 'center', lineWidth: 0.5 } },
+        ]);
+      } else if (valA.startsWith("---") || valA.startsWith("--")) {
+        const isMed = valA.toLowerCase().includes("medical");
+        const fill = isMed ? [198, 224, 180] : [248, 203, 173];
+        const text = isMed ? "-- Medical --" : "-- Surgical --";
+        body.push([{ content: text, colSpan: 6, styles: { fillColor: fill, fontStyle: 'bold', halign: 'center', lineWidth: 0.5, minCellHeight: 14 } }]);
       } else if (valA.startsWith("Outstanding Summary")) {
-        body.push([{ content: valA, colSpan: 7, styles: { fillColor: [68, 114, 196], textColor: [255, 255, 255], fontStyle: 'bold', halign: 'center', lineWidth: 0.5 } }]);
+        body.push([{ content: valA, colSpan: 6, styles: { fillColor: [68, 114, 196], textColor: [255, 255, 255], fontStyle: 'bold', halign: 'center', lineWidth: 0.5, minCellHeight: 16 } }]);
+      } else if (valA.toLowerCase().startsWith("rcpt")) {
+        body.push([{ content: valA, colSpan: 6, styles: { fontStyle: 'italic', halign: 'left', fontSize: 7, fillColor: [248, 250, 252], lineWidth: 0.5, lineColor: [200, 200, 200] } }]);
       } else {
-        // Normal data rows — format numeric columns with Indian grouping
-        body.push(row.map((cell, i) => {
-          let displayValue = (cell !== "" && cell !== null) ? String(cell) : "";
-          // Format Debit (3), Credit (4), Balance (5) with Indian numbers
-          if (i >= 3 && i <= 5 && cell !== "" && cell !== null && !isNaN(cell)) {
-            displayValue = formatIndianNumber(cell);
-          }
-          return {
-            content: displayValue,
-            styles: { halign: (i > 2 && cell !== "") ? 'right' : 'left', lineWidth: 0.1, lineColor: [200, 200, 200] }
-          };
-        }));
+        const is6Col = row.length === 6 || (row[0] && row[0] !== "");
+        const bill = String((is6Col ? row[0] : row[1]) || '');
+        const date = String((is6Col ? row[1] : row[2]) || '');
+        const debit = is6Col ? row[2] : row[3];
+        const credit = is6Col ? row[3] : row[4];
+        const balance = is6Col ? row[4] : row[5];
+        const days = String((is6Col ? row[5] : row[6]) || '');
+
+        const isBoldRow = bill.startsWith('*');
+        body.push([
+          { content: bill, styles: { fontStyle: isBoldRow ? 'bold' : 'normal', halign: 'center', lineWidth: 0.5, lineColor: [200, 200, 200] } },
+          { content: date, styles: { fontStyle: 'normal', halign: 'center', lineWidth: 0.5, lineColor: [200, 200, 200] } },
+          { content: formatIndianNumber(debit), styles: { fontStyle: 'normal', halign: 'right', lineWidth: 0.5, lineColor: [200, 200, 200] } },
+          { content: formatIndianNumber(credit), styles: { fontStyle: 'normal', halign: 'right', lineWidth: 0.5, lineColor: [200, 200, 200] } },
+          { content: formatIndianNumber(balance), styles: { fontStyle: isBoldRow ? 'bold' : 'normal', halign: 'right', lineWidth: 0.5, lineColor: [200, 200, 200] } },
+          { content: days, styles: { fontStyle: 'normal', halign: 'center', lineWidth: 0.5, lineColor: [200, 200, 200] } },
+        ]);
       }
     });
 
-    // ---------------------------------------------------------
-    // DYNAMIC HEIGHT CALCULATION:
-    // 1. Draw table on a fake, infinitely tall document
-    // ---------------------------------------------------------
     const A4_WIDTH_PT = 595.28;
-    const TOP_MARGIN = 45; // Extra space for title
-    const dummyDoc = new jsPDF('p', 'pt', [A4_WIDTH_PT, 99999]);
+    const TOP_MARGIN = 35;
+    const MARGIN_X = 25;
+    const TABLE_WIDTH = A4_WIDTH_PT - MARGIN_X * 2; // 545.28 pt
+
+    // 6-Column layout across 545.28 pt:
+    const colStyles = {
+      0: { cellWidth: 95, halign: 'center' },   // Bill (e.g. *RM-4498)
+      1: { cellWidth: 80, halign: 'center' },   // Date (e.g. 06-03-26)
+      2: { cellWidth: 95, halign: 'right' },    // Debit
+      3: { cellWidth: 85, halign: 'right' },    // Credit
+      4: { cellWidth: 105, halign: 'right' },   // Balance
+      5: { cellWidth: 85.28, halign: 'center' }, // Days
+    };
+
+    // Calculate dynamic single-page height safely without multi-page break
+    const maxSafeHeight = Math.max(841.89, body.length * 35 + 300);
+    const dummyDoc = new jsPDF({
+      orientation: 'portrait',
+      unit: 'pt',
+      format: [A4_WIDTH_PT, maxSafeHeight]
+    });
 
     autoTable(dummyDoc, {
       body: body,
       theme: 'grid',
-      styles: { fontSize: 8, cellPadding: 3, font: 'helvetica' },
-      margin: { top: TOP_MARGIN, left: 30, right: 30 },
-      tableWidth: 'auto',
+      styles: { fontSize: 7.5, cellPadding: 2.5, textColor: [0, 0, 0], font: 'helvetica' },
+      columnStyles: colStyles,
+      margin: { top: TOP_MARGIN, left: MARGIN_X, right: MARGIN_X, bottom: 0 },
+      tableWidth: TABLE_WIDTH,
     });
 
-    // 2. Extract exactly how tall the table ended up being
-    const totalContentHeight = dummyDoc.lastAutoTable.finalY + 30;
-    const finalPageHeight = Math.max(841.89, totalContentHeight);
+    const finalPageHeight = Math.max(841.89, dummyDoc.lastAutoTable.finalY + 40);
 
-    // ---------------------------------------------------------
-    // FINAL PDF GENERATION:
-    // Create the actual document using the exactly measured height
-    // ---------------------------------------------------------
-    const finalDoc = new jsPDF('p', 'pt', [A4_WIDTH_PT, finalPageHeight]);
+    // Second pass: Render exact single-page document
+    const finalDoc = new jsPDF({
+      orientation: 'portrait',
+      unit: 'pt',
+      format: [A4_WIDTH_PT, finalPageHeight]
+    });
 
-    // Add title
-    finalDoc.setFontSize(13);
+    // Add centered title
+    finalDoc.setFontSize(12);
     finalDoc.setFont('helvetica', 'bold');
-    finalDoc.setTextColor(50, 50, 50);
-    finalDoc.text(`Outstanding Report  —  ${getDisplayDate()}`, A4_WIDTH_PT / 2, 25, { align: 'center' });
+    finalDoc.setTextColor(40, 40, 40);
+    finalDoc.text(`Outstanding Report  —  ${getDisplayDate()}`, A4_WIDTH_PT / 2, 22, { align: 'center' });
 
     autoTable(finalDoc, {
       body: body,
       theme: 'grid',
-      styles: { fontSize: 8, cellPadding: 3, textColor: [0, 0, 0], font: 'helvetica' },
-      margin: { top: TOP_MARGIN, left: 30, right: 30 },
-      tableWidth: 'auto',
+      styles: { fontSize: 7.5, cellPadding: 2.5, textColor: [0, 0, 0], font: 'helvetica' },
+      columnStyles: colStyles,
+      margin: { top: TOP_MARGIN, left: MARGIN_X, right: MARGIN_X, bottom: 0 },
+      tableWidth: TABLE_WIDTH,
     });
 
     return finalDoc;
@@ -516,85 +866,133 @@ def process_file(filepath, master_data, file_label):
                 if not is_rcpt_row:
                     _warnings.append(f"[{fname}] Row {index + 1}: Could not process debit value '{row_data[3] if len(row_data) > 3 else 'N/A'}'")
 
-            if not is_rcpt_row: row_data[0] = ""
-            master_data[current_party_key][f'transactions_{file_label}'].append(row_data)
+            if is_rcpt_row:
+                master_data[current_party_key][f'transactions_{file_label}'].append([col_a_val, "", "", "", "", ""])
+            else:
+                bill_no = str(row_data[1]).strip()
+                date_val = str(row_data[2]).strip()
+                debit_val = row_data[3] if len(row_data) > 3 else ""
+                credit_val = row_data[4] if len(row_data) > 4 else ""
+                bal_val = row_data[5] if len(row_data) > 5 else ""
+                days_val = str(row_data[6]).strip() if len(row_data) > 6 else ""
+                master_data[current_party_key][f'transactions_{file_label}'].append([bill_no, date_val, debit_val, credit_val, bal_val, days_val])
 
 def style_excel_file(filename):
     wb = load_workbook(filename)
     ws = wb.active
     ws.title = "Outstanding Report"
-    HEADER_SIZE, REGULAR_SIZE = 14, 12
-    party_header_font = Font(bold=True, size=HEADER_SIZE, color="000000")
-    summary_font = Font(bold=True, size=HEADER_SIZE, color="FFFFFF")
-    section_font = Font(bold=True, size=12)
-    sub_header_font = Font(bold=True, size=REGULAR_SIZE)
-    regular_font = Font(size=REGULAR_SIZE)
+    
+    # Ensure grid lines are visible
+    ws.views.sheetView[0].showGridLines = True
 
+    # Fonts
+    party_header_font = Font(name="Calibri", bold=True, size=11, color="000000")
+    sub_header_font = Font(name="Calibri", bold=True, size=10, color="000000")
+    section_font = Font(name="Calibri", bold=True, size=10, color="000000")
+    summary_font = Font(name="Calibri", bold=True, size=10.5, color="FFFFFF")
+    regular_font = Font(name="Calibri", size=10)
+    bold_regular_font = Font(name="Calibri", bold=True, size=10)
+    rcpt_font = Font(name="Calibri", italic=True, size=9.5, color="333333")
+
+    # Fills
     party_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+    sub_header_fill = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
     medical_fill = PatternFill(start_color="C6E0B4", end_color="C6E0B4", fill_type="solid")
     surgical_fill = PatternFill(start_color="F8CBAD", end_color="F8CBAD", fill_type="solid")
-    sub_header_fill = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
     summary_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
-    thin = Side(style='thin')
+
+    # Borders
+    thin = Side(style='thin', color="B0B0B0")
     no_side = Side(border_style=None)
     thin_border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
     indian_num_format = '#,##,##0.00'
 
     for row in ws.iter_rows(min_row=1, max_row=ws.max_row):
-        if len(row) < 2: continue
         val_a = str(row[0].value).strip() if row[0].value else ""
-        val_b = str(row[1].value).strip() if row[1].value else ""
+        val_b = str(row[1].value).strip() if len(row) > 1 and row[1].value else ""
 
-        is_party_header = (val_a and not val_b and not val_a.lower().startswith("rcpt") and not val_a.startswith("Outstanding Summary") and not val_a.startswith("---"))
+        # Blank spacer row
+        if not any(c.value for c in row):
+            ws.row_dimensions[row[0].row].height = 14
+            for cell in row:
+                cell.border = Border(left=no_side, right=no_side, top=no_side, bottom=no_side)
+            continue
+
+        is_party_header = (val_a and not val_b and not val_a.lower().startswith("rcpt") and not val_a.startswith("Outstanding Summary") and not val_a.startswith("---") and not val_a.startswith("--") and val_a != "Bill")
 
         if is_party_header:
-            if len(row) >= 7:
-                for i in range(7):
+            ws.row_dimensions[row[0].row].height = 24
+            if len(row) >= 6:
+                for i in range(6):
                     row[i].fill = party_fill
-                    row[i].border = Border(top=thin, left=thin if i==6 else no_side, right=thin if i>=5 else no_side, bottom=no_side)
+                    row[i].border = Border(top=thin, left=thin if i in (0, 5) else no_side, right=thin if i in (4, 5) else no_side, bottom=thin)
                 row[0].font, row[0].alignment = party_header_font, Alignment(horizontal='center', vertical='center')
-                row[6].font, row[6].alignment = party_header_font, Alignment(horizontal='right', vertical='center')
-                if isinstance(row[6].value, (int, float)):
-                    row[6].number_format = indian_num_format
-                ws.merge_cells(start_row=row[0].row, start_column=1, end_row=row[0].row, end_column=6)
-        elif val_a.startswith("---"):
-            if len(row) >= 7:
-                ws.merge_cells(start_row=row[0].row, start_column=1, end_row=row[0].row, end_column=7)
-                row[0].font, row[0].alignment = section_font, Alignment(horizontal='center', vertical='center')
-                for cell in row: cell.fill, cell.border = (medical_fill if "Medical" in val_a else surgical_fill), thin_border
-        elif val_b == "Bill":
-            if len(row) >= 7:
-                for cell in row: cell.font, cell.fill, cell.border, cell.alignment = sub_header_font, sub_header_fill, thin_border, Alignment(horizontal='center')
-        elif val_a.startswith("Outstanding Summary"):
-            if len(row) >= 7:
-                for i in range(7): row[i].fill, row[i].border = summary_fill, Border(top=thin, left=no_side, right=no_side, bottom=no_side)
-                row[0].font, row[0].alignment = summary_font, Alignment(horizontal='center', vertical='center')
-                ws.merge_cells(start_row=row[0].row, start_column=1, end_row=row[0].row, end_column=7)
-        else:
-            if any(cell.value for cell in row):
-                if len(row) >= 7:
-                    for idx_c, cell in enumerate(row):
-                        cell.font, cell.border = regular_font, thin_border
-                        # Apply Indian number format to Debit(D=3), Credit(E=4), Balance(F=5) columns
-                        if idx_c in (3, 4, 5) and isinstance(cell.value, (int, float)):
-                            cell.number_format = indian_num_format
+                row[5].font, row[5].alignment = party_header_font, Alignment(horizontal='right', vertical='center')
+                if isinstance(row[5].value, (int, float)):
+                    row[5].number_format = indian_num_format
+                ws.merge_cells(start_row=row[0].row, start_column=1, end_row=row[0].row, end_column=5)
 
-    if ws.max_column > 0:
-        for i in range(1, ws.max_column + 1):
-            col_letter = get_column_letter(i)
-            max_length = 0
-            for cell in ws[col_letter]:
-                try:
-                    if cell.value:
-                        val = str(cell.value)
-                        current_row = ws[cell.row]
-                        if len(current_row) < 2: continue
-                        val_b_check = str(current_row[1].value).strip() if len(current_row) > 1 and current_row[1].value else ""
-                        if not (val.startswith("Outstanding Summary") or val.startswith("---") or val_b_check == "Bill"):
-                            max_length = max(max_length, len(val))
-                except: pass
-            ws.column_dimensions[col_letter].width = max(max_length + 2, 8) if i == 1 else min((max_length + 2), 60)
+        elif val_a.startswith("---") or val_a.startswith("--"):
+            ws.row_dimensions[row[0].row].height = 20
+            if len(row) >= 6:
+                ws.merge_cells(start_row=row[0].row, start_column=1, end_row=row[0].row, end_column=6)
+                row[0].font, row[0].alignment = section_font, Alignment(horizontal='center', vertical='center')
+                fill = medical_fill if "medical" in val_a.lower() else surgical_fill
+                for cell in row:
+                    cell.fill = fill
+                    cell.border = thin_border
+
+        elif val_a == "Bill":
+            ws.row_dimensions[row[0].row].height = 20
+            if len(row) >= 6:
+                for cell in row:
+                    cell.font, cell.fill, cell.border = sub_header_font, sub_header_fill, thin_border
+                    cell.alignment = Alignment(horizontal='center', vertical='center')
+
+        elif val_a.startswith("Outstanding Summary"):
+            ws.row_dimensions[row[0].row].height = 22
+            if len(row) >= 6:
+                for cell in row:
+                    cell.fill, cell.border = summary_fill, thin_border
+                row[0].font, row[0].alignment = summary_font, Alignment(horizontal='center', vertical='center')
+                ws.merge_cells(start_row=row[0].row, start_column=1, end_row=row[0].row, end_column=6)
+
+        elif val_a.lower().startswith("rcpt"):
+            ws.row_dimensions[row[0].row].height = 19
+            if len(row) >= 6:
+                ws.merge_cells(start_row=row[0].row, start_column=1, end_row=row[0].row, end_column=6)
+                for cell in row:
+                    cell.border = thin_border
+                row[0].font = rcpt_font
+                row[0].alignment = Alignment(horizontal='left', vertical='center')
+
+        else:
+            ws.row_dimensions[row[0].row].height = 19
+            is_bold_bill = val_a.startswith('*')
+            for idx_c, cell in enumerate(row):
+                cell.border = thin_border
+                if idx_c in (0, 1, 5):
+                    cell.font = bold_regular_font if (idx_c == 0 and is_bold_bill) else regular_font
+                    cell.alignment = Alignment(horizontal='center', vertical='center')
+                elif idx_c in (2, 3, 4):
+                    cell.font = bold_regular_font if (idx_c == 4 and is_bold_bill) else regular_font
+                    cell.alignment = Alignment(horizontal='right', vertical='center')
+                    if isinstance(cell.value, (int, float)):
+                        cell.number_format = indian_num_format
+
+    # Set polished column widths (6 columns)
+    column_widths = {
+        'A': 20, # Bill No
+        'B': 14, # Date
+        'C': 16, # Debit
+        'D': 14, # Credit
+        'E': 16, # Balance
+        'F': 12, # Days
+    }
+    for col_letter, width in column_widths.items():
+        ws.column_dimensions[col_letter].width = width
+
     wb.save(filename)
 
 # Execution
@@ -603,30 +1001,30 @@ if os.path.exists(FILE_1): process_file(FILE_1, combined_data, 'file1')
 if os.path.exists(FILE_2): process_file(FILE_2, combined_data, 'file2')
 
 final_output_rows = []
-transaction_header = ["Type", "Bill", "Date", "Debit", "Credit", "Balance", "Days"]
+transaction_header = ["Bill", "Date", "Debit", "Credit", "Balance", "Days"]
 
 for key, data in combined_data.items():
-    header_row = [f"{data['original_name']}  ({data['city']})", "", "", "", "", "", data['total_combined']]
+    header_row = [f"{data['original_name']}  ({data['city']})", "", "", "", "", data['total_combined']]
     final_output_rows.append(header_row)
     final_output_rows.append(transaction_header)
 
     if data['transactions_file1']:
-        final_output_rows.append(["--- Medical ---", "", "", "", "", "", ""])
+        final_output_rows.append(["--- Medical ---", "", "", "", "", ""])
         for trans in data['transactions_file1']:
             padded = list(trans)
-            while len(padded) < 7: padded.append("")
-            final_output_rows.append(padded[:7])
+            while len(padded) < 6: padded.append("")
+            final_output_rows.append(padded[:6])
 
     if data['transactions_file2']:
-        final_output_rows.append(["--- Surgical ---", "", "", "", "", "", ""])
+        final_output_rows.append(["--- Surgical ---", "", "", "", "", ""])
         for trans in data['transactions_file2']:
             padded = list(trans)
-            while len(padded) < 7: padded.append("")
-            final_output_rows.append(padded[:7])
+            while len(padded) < 6: padded.append("")
+            final_output_rows.append(padded[:6])
 
     t1, t2, total = data['totals_breakdown']['file1'], data['totals_breakdown']['file2'], data['total_combined']
-    final_output_rows.append([f"Outstanding Summary   |   Medical: {format_indian(t1)}   |   Surgical: {format_indian(t2)}   |   Total: {format_indian(total)}", "", "", "", "", "", ""])
-    final_output_rows.append([""] * 7)
+    final_output_rows.append([f"Outstanding Summary   |   Medical: {format_indian(t1)}   |   Surgical: {format_indian(t2)}   |   Total: {format_indian(total)}", "", "", "", "", ""])
+    final_output_rows.append([""] * 6)
 
 # 1. Save Excel
 df = pd.DataFrame(final_output_rows)
@@ -650,13 +1048,14 @@ json.dumps({"data": clean_rows, "warnings": len(_warnings), "warning_details": _
   // 5. Logic: Execute Pipeline
   // ----------------------------------------------------------------------
   const handleMerge = async () => {
-    if (!pyodide) { setError("Python environment is not ready."); return; }
+    if (!isWorkerReady) { setError("Python environment is not ready."); return; }
 
     setIsProcessing(true);
     setLogs([]);
     setError(null);
     setWarningCount(0);
     setPreviewData(null);
+    setParsedRows(null);
     if (processedFileUrl) URL.revokeObjectURL(processedFileUrl);
     if (processedPdfUrl) URL.revokeObjectURL(processedPdfUrl);
     setProcessedFileUrl(null);
@@ -669,34 +1068,36 @@ json.dumps({"data": clean_rows, "warnings": len(_warnings), "warning_details": _
 
     try {
       addLog("Reading uploaded files...");
-      let medicalVfsName = "";
-      let surgicalVfsName = "";
+      const f1Ext = file1.file.name.split('.').pop();
+      const f2Ext = file2.file.name.split('.').pop();
 
-      const processUpload = async (fData) => {
-        const ext = fData.file.name.split('.').pop();
-        const arrayBuffer = await fData.file.arrayBuffer();
-        const targetName = fData.label === "RAHUL MEDICAL & SURGICAL" ? `medical_input.${ext}` : `surgical_input.${ext}`;
-        if (fData.label === "RAHUL MEDICAL & SURGICAL") medicalVfsName = targetName;
-        else surgicalVfsName = targetName;
+      const f1Name = file1.label === "RAHUL MEDICAL & SURGICAL" ? `medical_input.${f1Ext}` : `surgical_input.${f1Ext}`;
+      const f2Name = file2.label === "RAHUL MEDICAL & SURGICAL" ? `medical_input.${f2Ext}` : `surgical_input.${f2Ext}`;
 
-        pyodide.FS.writeFile(targetName, new Uint8Array(arrayBuffer));
-        addLog(`Saved as "${targetName}" in virtual memory.`);
-      };
+      const medicalVfsName = file1.label === "RAHUL MEDICAL & SURGICAL" ? f1Name : f2Name;
+      const surgicalVfsName = file1.label === "RAHUL MEDICAL & SURGICAL" ? f2Name : f1Name;
 
-      await processUpload(file1);
-      await processUpload(file2);
+      const f1Buffer = await file1.file.arrayBuffer();
+      const f2Buffer = await file2.file.arrayBuffer();
 
-      addLog("Executing Python logic...");
-      pyodide.setStdout({ batched: (msg) => addLog(`[PY] ${msg}`) });
+      const workerFiles = [
+        { name: f1Name, buffer: f1Buffer },
+        { name: f2Name, buffer: f2Buffer }
+      ];
+
+      addLog(`Saved "${f1Name}" and "${f2Name}" in worker memory.`);
+      addLog("Executing Python logic in background worker...");
 
       const finalScript = getPythonScript(medicalVfsName, surgicalVfsName);
 
-      // Get JSON payload back from Python
-      const jsonResult = await pyodide.runPythonAsync(finalScript);
-      const result = JSON.parse(jsonResult);
-      const parsedData = result.data;
-      const warnCount = result.warnings || 0;
-      const warnDetails = result.warning_details || [];
+      // Execute Python logic in Web Worker
+      const { excelBuffer, jsonResult } = await runMergeWorker(workerFiles, finalScript);
+      const parsedData = jsonResult.data;
+      const warnCount = jsonResult.warnings || 0;
+      const warnDetails = jsonResult.warning_details || [];
+
+      // Save raw rows for ZIP party card generation
+      setParsedRows(parsedData);
 
       // Show warnings if any
       if (warnCount > 0) {
@@ -710,14 +1111,13 @@ json.dumps({"data": clean_rows, "warnings": len(_warnings), "warning_details": _
       setPreviewData(preview);
 
       // Create PDF
-      const pdfDoc = generatePDF(parsedData);
+      const pdfDoc = await generatePDF(parsedData);
       const pdfBlob = pdfDoc.output('blob');
       setProcessedPdfUrl(URL.createObjectURL(pdfBlob));
 
       // Fetch Excel
-      if (pyodide.FS.analyzePath("Final_Merged_Report.xlsx").exists) {
-        const fileContent = pyodide.FS.readFile("Final_Merged_Report.xlsx");
-        const blob = new Blob([fileContent], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+      if (excelBuffer) {
+        const blob = new Blob([excelBuffer], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
         setProcessedFileUrl(URL.createObjectURL(blob));
         addLog("Merge successful! Excel & PDF ready for download.");
       }
@@ -732,6 +1132,73 @@ json.dumps({"data": clean_rows, "warnings": len(_warnings), "warning_details": _
     }
   };
 
+  // ----------------------------------------------------------------------
+  // 6. Logic: Generate Party Image Cards and Download ZIP
+  // ----------------------------------------------------------------------
+  const handleDownloadZip = async () => {
+    if (!parsedRows || parsedRows.length === 0) {
+      setError("No processed party data available. Please merge files first.");
+      return;
+    }
+
+    setIsGeneratingZip(true);
+    setZipProgress({ current: 0, total: 0 });
+    addLog("Starting individual party card generation...");
+
+    try {
+      const JSZipModule = await import('jszip');
+      const JSZip = JSZipModule.default || JSZipModule;
+      const parties = groupRowsByParty(parsedRows);
+      if (parties.length === 0) {
+        setError("No parties found to generate images.");
+        setIsGeneratingZip(false);
+        return;
+      }
+
+      const zip = new JSZip();
+      const formattedDate = getDisplayDate();
+      const totalParties = parties.length;
+      setZipProgress({ current: 0, total: totalParties });
+
+      for (let i = 0; i < totalParties; i++) {
+        const party = parties[i];
+        setZipProgress({ current: i + 1, total: totalParties });
+
+        // Yield thread so React can render progress bar
+        await new Promise(resolve => setTimeout(resolve, 0));
+
+        const blob = await renderPartyCardCanvas(party, formattedDate);
+        const safeName = sanitizeFilename(party.displayName);
+        zip.file(`${safeName}.png`, blob);
+      }
+
+      addLog(`Packing ${totalParties} party cards into ZIP archive...`);
+      const zipBlob = await zip.generateAsync({
+        type: "blob",
+        compression: "DEFLATE",
+        compressionOptions: { level: 6 }
+      });
+
+      const zipFilename = `Party_Wise_Reports_${getDateString()}.zip`;
+      const url = URL.createObjectURL(zipBlob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = zipFilename;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
+
+      addLog(`Successfully downloaded "${zipFilename}"!`);
+    } catch (err) {
+      console.error("ZIP Generation error:", err);
+      setError(`Failed to generate images ZIP: ${err.message}`);
+      addLog(`[ERROR] Image ZIP: ${err.message}`);
+    } finally {
+      setIsGeneratingZip(false);
+    }
+  };
+
   // --- Output filename with date ---
   const outputBaseName = `Merged_Report_${getDateString()}`;
 
@@ -739,22 +1206,22 @@ json.dumps({"data": clean_rows, "warnings": len(_warnings), "warning_details": _
   // RENDER
   // ====================================================================
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-800 font-sans p-4 sm:p-6">
+    <main id="main-content" className="min-h-screen bg-slate-50 text-slate-800 font-sans p-4 sm:p-6">
       <div className="max-w-3xl mx-auto bg-white shadow-xl rounded-xl overflow-hidden border border-slate-200">
 
         {/* ── Header ── */}
-        <div className="bg-blue-600 p-6 text-white">
+        <header className="bg-blue-600 p-6 text-white">
           <h1 className="text-2xl font-bold flex items-center gap-2">
             <FileSpreadsheet aria-hidden="true" /> Excel Merge Tool
           </h1>
-          <p className="text-blue-100 mt-2 text-sm">
-            Securely merge and export Surgical and Medical reports to Excel and PDF.
+          <p className="text-blue-50 mt-2 text-sm font-normal">
+            Securely merge and export Surgical and Medical reports to Excel, PDF, and image cards.
           </p>
-        </div>
+        </header>
 
         {/* ── Progress Stepper ── */}
         {!loading && (
-          <div className="px-6 pt-5 pb-1" aria-label="Progress steps">
+          <nav className="px-6 pt-5 pb-1" aria-label="Progress steps">
             <div className="flex items-center justify-center">
               {[
                 { num: 1, label: "Upload" },
@@ -772,11 +1239,11 @@ json.dumps({"data": clean_rows, "warnings": len(_warnings), "warning_details": _
                       <div className={`w-8 h-8 rounded-full flex items-center justify-center text-sm font-bold transition-colors ${
                         isCompleted ? 'bg-green-500 text-white' :
                         isCurrent ? 'bg-blue-600 text-white' :
-                        'bg-slate-200 text-slate-400'
+                        'bg-slate-200 text-slate-700'
                       }`}>
                         {isCompleted ? <CheckCircle size={16} aria-hidden="true" /> : step.num}
                       </div>
-                      <span className={`text-xs font-medium ${isCurrent ? 'text-blue-600' : isCompleted ? 'text-green-600' : 'text-slate-400'}`}>
+                      <span className={`text-xs font-medium ${isCurrent ? 'text-blue-600' : isCompleted ? 'text-green-600' : 'text-slate-600'}`}>
                         {step.label}
                       </span>
                     </div>
@@ -784,7 +1251,7 @@ json.dumps({"data": clean_rows, "warnings": len(_warnings), "warning_details": _
                 );
               })}
             </div>
-          </div>
+          </nav>
         )}
 
         {/* ── Loading State ── */}
@@ -823,8 +1290,8 @@ json.dumps({"data": clean_rows, "warnings": len(_warnings), "warning_details": _
                     />
                   </div>
                 </div>
-                <p className="text-slate-600 font-medium text-sm">{LOADING_STEPS[loadingStep]}</p>
-                <p className="text-slate-400 text-xs mt-2">This usually takes 10–20 seconds on first visit</p>
+                <p className="text-slate-700 font-medium text-sm">{LOADING_STEPS[loadingStep]}</p>
+                <p className="text-slate-600 text-xs mt-2">This usually takes 10–20 seconds on first visit</p>
               </>
             )}
           </div>
@@ -894,10 +1361,10 @@ json.dumps({"data": clean_rows, "warnings": len(_warnings), "warning_details": _
                             <span className="text-xs font-medium truncate w-full px-2" title={fData.name}>{fData.name}</span>
                           </div>
                         ) : (
-                          <div className="flex flex-col items-center text-slate-400 group-hover:text-blue-500">
+                          <div className="flex flex-col items-center text-slate-600 group-hover:text-blue-600">
                             <Upload size={24} className="mb-2" aria-hidden="true" />
-                            <span className="text-xs font-medium">Click or Drag Excel File</span>
-                            <span className="text-[10px] mt-1">Supports .xls and .xlsx</span>
+                            <span className="text-xs font-semibold">Click or Drag Excel File</span>
+                            <span className="text-xs text-slate-500 mt-1">Supports .xls and .xlsx</span>
                           </div>
                         )}
                       </div>
@@ -905,13 +1372,13 @@ json.dumps({"data": clean_rows, "warnings": len(_warnings), "warning_details": _
 
                     {/* File validation error */}
                     {fileErrors[key] && (
-                      <p className="text-red-500 text-xs mb-2 flex items-center gap-1">
+                      <p className="text-red-600 text-xs mb-2 flex items-center gap-1">
                         <AlertCircle size={12} aria-hidden="true" /> {fileErrors[key]}
                       </p>
                     )}
 
                     {/* Label selector */}
-                    <label htmlFor={`label-${key}`} className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">
+                    <label htmlFor={`label-${key}`} className="block text-xs font-bold text-slate-700 uppercase tracking-wider mb-1">
                       Identify Source
                     </label>
                     <select
@@ -943,9 +1410,9 @@ json.dumps({"data": clean_rows, "warnings": len(_warnings), "warning_details": _
               {!processedFileUrl ? (
                 <button
                   onClick={handleMerge}
-                  disabled={isProcessing || !pyodide || currentStep < 2}
+                  disabled={isProcessing || !isWorkerReady || currentStep < 2}
                   className={`flex items-center gap-2 px-8 py-3 rounded-full font-bold shadow-lg transition-all ${
-                    (isProcessing || !pyodide || currentStep < 2)
+                    (isProcessing || !isWorkerReady || currentStep < 2)
                       ? 'bg-slate-300 text-slate-500 cursor-not-allowed'
                       : 'bg-blue-600 hover:bg-blue-700 text-white hover:-translate-y-1'
                   }`}
@@ -1013,25 +1480,59 @@ json.dumps({"data": clean_rows, "warnings": len(_warnings), "warning_details": _
                   )}
 
                   {/* ── Download Buttons ── */}
-                  <div className="flex flex-col sm:flex-row gap-3">
+                  <div className="flex flex-wrap items-center justify-center gap-3">
                     <a
                       href={processedFileUrl}
                       download={`${outputBaseName}.xlsx`}
-                      className="flex items-center justify-center gap-2 px-6 py-2.5 rounded-full font-bold shadow-md bg-green-600 hover:bg-green-700 text-white text-sm transition-all hover:-translate-y-0.5"
+                      className="flex items-center justify-center gap-2 px-5 py-2.5 rounded-full font-bold shadow-md bg-green-600 hover:bg-green-700 text-white text-sm transition-all hover:-translate-y-0.5"
                     >
                       <FileSpreadsheet size={18} aria-hidden="true" /> Download Excel
                     </a>
                     <a
                       href={processedPdfUrl}
                       download={`${outputBaseName}.pdf`}
-                      className="flex items-center justify-center gap-2 px-6 py-2.5 rounded-full font-bold shadow-md bg-red-500 hover:bg-red-600 text-white text-sm transition-all hover:-translate-y-0.5"
+                      className="flex items-center justify-center gap-2 px-5 py-2.5 rounded-full font-bold shadow-md bg-red-500 hover:bg-red-600 text-white text-sm transition-all hover:-translate-y-0.5"
                     >
                       <FileText size={18} aria-hidden="true" /> Download PDF
                     </a>
-                    <button onClick={resetApp} className="flex items-center justify-center gap-2 px-5 py-2.5 rounded-full font-bold border-2 border-slate-200 text-slate-600 text-sm hover:bg-slate-50 transition-all">
+                    <button
+                      onClick={handleDownloadZip}
+                      disabled={isGeneratingZip || !parsedRows}
+                      className="flex items-center justify-center gap-2 px-5 py-2.5 rounded-full font-bold shadow-md bg-amber-600 hover:bg-amber-700 text-white text-sm transition-all hover:-translate-y-0.5 disabled:bg-amber-300 disabled:cursor-not-allowed"
+                      aria-label="Download party report images as ZIP"
+                    >
+                      {isGeneratingZip ? (
+                        <>
+                          <RefreshCw className="animate-spin" size={18} aria-hidden="true" />
+                          <span>Generating ({zipProgress.current}/{zipProgress.total})...</span>
+                        </>
+                      ) : (
+                        <>
+                          <FolderArchive size={18} aria-hidden="true" />
+                          <span>Download Images (ZIP)</span>
+                        </>
+                      )}
+                    </button>
+                    <button onClick={resetApp} className="flex items-center justify-center gap-2 px-4 py-2.5 rounded-full font-bold border-2 border-slate-200 text-slate-600 text-sm hover:bg-slate-50 transition-all">
                       <RotateCcw size={16} aria-hidden="true" /> Start Over
                     </button>
                   </div>
+
+                  {/* ── ZIP Generation Progress Bar ── */}
+                  {isGeneratingZip && (
+                    <div className="w-full max-w-md bg-amber-50 border border-amber-200 rounded-lg p-3 text-center">
+                      <div className="flex justify-between text-xs text-amber-900 font-medium mb-1.5">
+                        <span>Rendering party card images...</span>
+                        <span>{zipProgress.current} of {zipProgress.total}</span>
+                      </div>
+                      <div className="w-full bg-amber-200 rounded-full h-2 overflow-hidden">
+                        <div
+                          className="bg-amber-600 h-2 rounded-full transition-all duration-100"
+                          style={{ width: `${zipProgress.total > 0 ? Math.round((zipProgress.current / zipProgress.total) * 100) : 0}%` }}
+                        />
+                      </div>
+                    </div>
+                  )}
                 </>
               )}
             </div>
@@ -1040,7 +1541,7 @@ json.dumps({"data": clean_rows, "warnings": len(_warnings), "warning_details": _
             <div className="mt-2">
               <button
                 onClick={() => setShowLogs(!showLogs)}
-                className="flex items-center gap-2 text-xs font-semibold text-slate-400 hover:text-slate-600 transition-colors mx-auto"
+                className="flex items-center gap-2 text-xs font-semibold text-slate-600 hover:text-slate-900 transition-colors mx-auto p-1 rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
                 aria-expanded={showLogs}
                 aria-controls="log-panel"
               >
@@ -1048,8 +1549,8 @@ json.dumps({"data": clean_rows, "warnings": len(_warnings), "warning_details": _
               </button>
               {showLogs && (
                 <div id="log-panel" role="log" aria-live="polite" className="bg-slate-900 rounded-lg p-4 font-mono text-xs text-green-400 h-48 overflow-y-auto mt-3 shadow-inner">
-                  <div className="text-slate-500 border-b border-slate-800 pb-2 mb-2 flex justify-between"><span>System Logs</span></div>
-                  {logs.length === 0 && <span className="text-slate-600 italic">Waiting for input...</span>}
+                  <div className="text-slate-400 border-b border-slate-800 pb-2 mb-2 flex justify-between"><span>System Logs</span></div>
+                  {logs.length === 0 && <span className="text-slate-500 italic">Waiting for input...</span>}
                   {logs.map((log, i) => <div key={i} className="mb-1 leading-relaxed">{log}</div>)}
                 </div>
               )}
@@ -1058,7 +1559,7 @@ json.dumps({"data": clean_rows, "warnings": len(_warnings), "warning_details": _
           </div>
         )}
       </div>
-    </div>
+    </main>
   );
 };
 

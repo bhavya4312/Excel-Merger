@@ -198,3 +198,34 @@ Each matched party produces this block:
 - The page height is dynamically calculated to fit all content without pagination.
 - Numeric values in Debit, Credit, and Balance columns use Indian comma grouping.
 - **Output filename:** `Merged_Report_YYYY-MM-DD.pdf`
+
+---
+
+## Party Images & ZIP Archive
+
+The app can generate standalone, high-DPI image cards for each individual customer, bundled into a single ZIP archive.
+
+### Image Format & Resolution
+- **Format:** Lossless `.png`
+- **Resolution:** 2x DPR (retina-scaled) for crisp typography on mobile screens and messaging apps (WhatsApp)
+- **Width:** 880px (logical) / 1760px (actual pixels)
+- **Height:** Dynamic, auto-sized to fit the party's transactions without unnecessary whitespace
+
+### Card Layout
+Each image card includes:
+1. **Header Box:**
+   - Badge: `OUTSTANDING STATEMENT`
+   - Statement date stamp
+   - Party Name & City
+   - Included companies subtitle (*Rahul Medical & Surgicals* / *Rahul Surgical*)
+   - Total Outstanding balance badge
+2. **Transaction Tables:**
+   - Entity-wise section banners in **BOLD & UPPERCASE** (`--- RAHUL MEDICAL & SURGICALS ---` in light green / `--- RAHUL SURGICAL ---` in light orange)
+   - **6 columns** (`Bill`, `Date`, `Debit`, `Credit`, `Balance`, `Days`) with Indian currency formatting (the redundant empty `Type` column has been omitted on cards to maximize column widths for clarity)
+   - Styled receipt rows (`📄 Rcpt:...`) spanning full width
+3. **Summary Footer Bar:**
+   - Dark blue banner (`#4472C4`) with white bold text displaying Medical, Surgical, and Total amounts.
+
+### ZIP Archive Details
+- **Archive filename:** `Party_Wise_Reports_YYYY-MM-DD.zip`
+- **Internal file naming:** `[Party Name] ([City]).png` (e.g. `DR.ARVIND MAHANT (DIPKA).png`), with illegal filesystem characters (`/`, `\`, `:`, `*`, `?`, `"`, `<`, `>`, `|`) sanitized.

@@ -12,7 +12,7 @@ def detect():
         if 'RAHUL MEDICAL' in full_text or 'MEDICAL & SURGICAL' in full_text:
             return 'RAHUL MEDICAL & SURGICAL'
         elif 'RAHUL SURGICAL' in full_text or 'SURGICAL' in full_text:
-            return 'RAHUL SURGICAL'
+            return 'RAHUL SURGICALS'
         return None
     except Exception as e:
         return None

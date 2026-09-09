@@ -224,10 +224,10 @@ def parse_output_file(filepath):
             continue
 
         # Section headers
-        if col_a.startswith('--- Medical') or col_a.startswith('-- Medical'):
+        if (col_a.startswith('---') or col_a.startswith('--')) and 'medical' in col_a.lower():
             current_section = 'Medical'
             continue
-        if col_a.startswith('--- Surgical') or col_a.startswith('-- Surgical'):
+        if (col_a.startswith('---') or col_a.startswith('--')) and 'surgical' in col_a.lower():
             current_section = 'Surgical'
             continue
 

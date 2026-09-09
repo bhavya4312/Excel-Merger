@@ -5,7 +5,7 @@ import { initPyodideWorker, autoDetectLabelWorker, runMergeWorker } from './pyod
 // ============================================================================
 // Constants (outside component — no re-creation on render)
 // ============================================================================
-const OPTIONS = ["RAHUL SURGICAL", "RAHUL MEDICAL & SURGICAL"];
+const OPTIONS = ["RAHUL SURGICALS", "RAHUL MEDICAL & SURGICAL"];
 const MAX_FILE_SIZE_MB = 50;
 const VALID_EXTENSIONS = ['xls', 'xlsx'];
 
@@ -151,11 +151,11 @@ const groupRowsByParty = (data) => {
 
     if (!currentParty) return;
 
-    if (valA.startsWith("--- Medical") || valA.startsWith("-- Medical")) {
+    if ((valA.startsWith("---") || valA.startsWith("--")) && valA.toLowerCase().includes("medical")) {
       currentSection = "medical";
       return;
     }
-    if (valA.startsWith("--- Surgical") || valA.startsWith("-- Surgical")) {
+    if ((valA.startsWith("---") || valA.startsWith("--")) && valA.toLowerCase().includes("surgical")) {
       currentSection = "surgical";
       return;
     }
@@ -196,10 +196,10 @@ const renderPartyCardCanvas = (party, formattedDate) => {
 
     const headerHeight = 92;
     const sectionGap = 16;
-    const bannerHeight = 28;
-    const tableHeaderHeight = 30;
-    const rowHeight = 28;
-    const summaryHeight = 38;
+    const bannerHeight = 32;
+    const tableHeaderHeight = 32;
+    const rowHeight = 32;
+    const summaryHeight = 44;
 
     const medRows = party.medicalTransactions.length;
     const surgRows = party.surgicalTransactions.length;
@@ -261,9 +261,9 @@ const renderPartyCardCanvas = (party, formattedDate) => {
     const hasMed = medRows > 0;
     const hasSurg = surgRows > 0;
     let companiesText = '';
-    if (hasMed && hasSurg) companiesText = 'Rahul Medical & Surgicals  •  Rahul Surgical';
-    else if (hasMed) companiesText = 'Rahul Medical & Surgicals';
-    else if (hasSurg) companiesText = 'Rahul Surgical';
+    if (hasMed && hasSurg) companiesText = 'Rahul Medical & Surgical  •  Rahul Surgicals';
+    else if (hasMed) companiesText = 'Rahul Medical & Surgical';
+    else if (hasSurg) companiesText = 'Rahul Surgicals';
 
     ctx.fillStyle = '#475569';
     ctx.font = '500 12px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
@@ -271,7 +271,7 @@ const renderPartyCardCanvas = (party, formattedDate) => {
 
     // Total Outstanding on Header Right
     ctx.fillStyle = '#1E3A8A';
-    ctx.font = 'bold 20px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+    ctx.font = 'bold 22px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
     ctx.textAlign = 'right';
     ctx.fillText(`₹${formatIndianNumber(party.totalAmount || 0)}`, padX + contentWidth - 16, y + 52);
 
@@ -282,13 +282,13 @@ const renderPartyCardCanvas = (party, formattedDate) => {
 
     y += headerHeight + sectionGap;
 
-    // --- Table Column Layout (6 columns, Type removed) ---
+    // --- Table Column Layout (6 columns: Bill, Date, Amount, Deposit, Balance, Days) ---
     const cols = [
-      { title: 'Bill', width: 0.20, align: 'left' },
-      { title: 'Date', width: 0.15, align: 'center' },
-      { title: 'Debit (₹)', width: 0.17, align: 'right' },
-      { title: 'Credit (₹)', width: 0.17, align: 'right' },
-      { title: 'Balance (₹)', width: 0.19, align: 'right' },
+      { title: 'Bill', width: 0.18, align: 'left' },
+      { title: 'Date', width: 0.14, align: 'center' },
+      { title: 'Amount (₹)', width: 0.18, align: 'right' },
+      { title: 'Deposit (₹)', width: 0.18, align: 'right' },
+      { title: 'Balance (₹)', width: 0.20, align: 'right' },
       { title: 'Days', width: 0.12, align: 'center' },
     ];
 
@@ -310,7 +310,7 @@ const renderPartyCardCanvas = (party, formattedDate) => {
       ctx.fillStyle = bannerTextColor;
       ctx.font = 'bold 13px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
       ctx.textAlign = 'center';
-      ctx.fillText(sectionTitle, padX + contentWidth / 2, y + 19);
+      ctx.fillText(sectionTitle, padX + contentWidth / 2, y + 21);
 
       y += bannerHeight;
 
@@ -322,14 +322,14 @@ const renderPartyCardCanvas = (party, formattedDate) => {
       ctx.strokeRect(padX, y, contentWidth, tableHeaderHeight);
 
       ctx.fillStyle = '#334155';
-      ctx.font = 'bold 12px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+      ctx.font = 'bold 12.5px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
 
       cols.forEach(col => {
         let textX = col.x + 8;
         if (col.align === 'center') textX = col.x + col.colWidth / 2;
         if (col.align === 'right') textX = col.x + col.colWidth - 8;
         ctx.textAlign = col.align;
-        ctx.fillText(col.title, textX, y + 19);
+        ctx.fillText(col.title, textX, y + 20);
       });
 
       y += tableHeaderHeight;
@@ -350,9 +350,9 @@ const renderPartyCardCanvas = (party, formattedDate) => {
           ctx.fillStyle = '#EFF6FF';
           ctx.fillRect(padX + 1, y + 1, contentWidth - 2, rowHeight - 2);
           ctx.fillStyle = '#1D4ED8';
-          ctx.font = 'italic 12px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+          ctx.font = 'italic 12.5px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
           ctx.textAlign = 'left';
-          ctx.fillText(`📄  ${valA}`, padX + 12, y + 18);
+          ctx.fillText(`📄  ${valA}`, padX + 12, y + 21);
         } else {
           const is6Col = tx.length === 6 || (tx[0] && tx[0] !== "");
           const bill = String((is6Col ? tx[0] : tx[1]) || '').trim();
@@ -368,35 +368,37 @@ const renderPartyCardCanvas = (party, formattedDate) => {
 
           // Bill
           ctx.fillStyle = '#0F172A';
-          ctx.font = bill.startsWith('*') ? 'bold 12px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif' : '12px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+          ctx.font = bill.startsWith('*') ? 'bold 13px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif' : '500 13px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
           ctx.textAlign = 'left';
-          ctx.fillText(bill, cols[0].x + 8, y + 18);
+          ctx.fillText(bill, cols[0].x + 8, y + 21);
 
           // Date
           ctx.fillStyle = '#475569';
-          ctx.font = '12px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+          ctx.font = '500 12.5px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
           ctx.textAlign = 'center';
-          ctx.fillText(date, cols[1].x + cols[1].colWidth / 2, y + 18);
+          ctx.fillText(date, cols[1].x + cols[1].colWidth / 2, y + 21);
 
-          // Debit
+          // Amount (was Debit) — Bold, high readability
           ctx.fillStyle = '#0F172A';
+          ctx.font = '600 13.5px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
           ctx.textAlign = 'right';
-          ctx.fillText(debitVal !== null ? formatIndianNumber(debitVal) : '', cols[2].x + cols[2].colWidth - 8, y + 18);
+          ctx.fillText(debitVal !== null ? formatIndianNumber(debitVal) : '', cols[2].x + cols[2].colWidth - 8, y + 21);
 
-          // Credit
-          ctx.fillStyle = creditVal && creditVal > 0 ? '#15803D' : '#0F172A';
-          ctx.fillText(creditVal !== null ? formatIndianNumber(creditVal) : '', cols[3].x + cols[3].colWidth - 8, y + 18);
+          // Deposit (was Credit) — Bold green if > 0
+          ctx.fillStyle = creditVal && creditVal > 0 ? '#15803D' : '#64748B';
+          ctx.font = '600 13.5px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+          ctx.fillText(creditVal !== null ? formatIndianNumber(creditVal) : '', cols[3].x + cols[3].colWidth - 8, y + 21);
 
-          // Balance
+          // Balance — High contrast bold
           ctx.fillStyle = '#0F172A';
-          ctx.font = 'bold 12px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
-          ctx.fillText(balanceVal !== null ? formatIndianNumber(balanceVal) : '', cols[4].x + cols[4].colWidth - 8, y + 18);
+          ctx.font = 'bold 14px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+          ctx.fillText(balanceVal !== null ? formatIndianNumber(balanceVal) : '', cols[4].x + cols[4].colWidth - 8, y + 21);
 
           // Days
-          ctx.fillStyle = '#64748B';
-          ctx.font = '12px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+          ctx.fillStyle = '#475569';
+          ctx.font = '600 12.5px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
           ctx.textAlign = 'center';
-          ctx.fillText(days, cols[5].x + cols[5].colWidth / 2, y + 18);
+          ctx.fillText(days, cols[5].x + cols[5].colWidth / 2, y + 21);
         }
 
         y += rowHeight;
@@ -406,10 +408,10 @@ const renderPartyCardCanvas = (party, formattedDate) => {
     };
 
     if (medRows > 0) {
-      drawTable('--- RAHUL MEDICAL & SURGICALS ---', '#C6E0B4', '#1B4D1B', party.medicalTransactions);
+      drawTable('--- RAHUL MEDICAL & SURGICAL ---', '#C6E0B4', '#1B4D1B', party.medicalTransactions);
     }
     if (surgRows > 0) {
-      drawTable('--- RAHUL SURGICAL ---', '#F8CBAD', '#7C2D12', party.surgicalTransactions);
+      drawTable('--- RAHUL SURGICALS ---', '#F8CBAD', '#7C2D12', party.surgicalTransactions);
     }
 
     // --- 3. Summary Footer Bar ---
@@ -420,13 +422,13 @@ const renderPartyCardCanvas = (party, formattedDate) => {
     ctx.strokeRect(padX, y, contentWidth, summaryHeight);
 
     ctx.fillStyle = '#FFFFFF';
-    ctx.font = 'bold 13px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+    ctx.font = 'bold 14px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
     ctx.textAlign = 'center';
 
     const medStr = `Medical: ₹${formatIndianNumber(party.medicalTotal || 0)}`;
     const surgStr = `Surgical: ₹${formatIndianNumber(party.surgicalTotal || 0)}`;
     const totalStr = `Total: ₹${formatIndianNumber(party.totalAmount || 0)}`;
-    ctx.fillText(`Outstanding Summary   |   ${medStr}   |   ${surgStr}   |   ${totalStr}`, padX + contentWidth / 2, y + 23);
+    ctx.fillText(`Outstanding Summary   |   ${medStr}   |   ${surgStr}   |   ${totalStr}`, padX + contentWidth / 2, y + 27);
 
     canvas.toBlob((blob) => {
       resolve(blob);
@@ -658,15 +660,15 @@ const App = () => {
         body.push([
           { content: 'Bill', styles: { fillColor: [242, 242, 242], fontStyle: 'bold', halign: 'center', lineWidth: 0.5 } },
           { content: 'Date', styles: { fillColor: [242, 242, 242], fontStyle: 'bold', halign: 'center', lineWidth: 0.5 } },
-          { content: 'Debit', styles: { fillColor: [242, 242, 242], fontStyle: 'bold', halign: 'center', lineWidth: 0.5 } },
-          { content: 'Credit', styles: { fillColor: [242, 242, 242], fontStyle: 'bold', halign: 'center', lineWidth: 0.5 } },
+          { content: 'Amount', styles: { fillColor: [242, 242, 242], fontStyle: 'bold', halign: 'center', lineWidth: 0.5 } },
+          { content: 'Deposit', styles: { fillColor: [242, 242, 242], fontStyle: 'bold', halign: 'center', lineWidth: 0.5 } },
           { content: 'Balance', styles: { fillColor: [242, 242, 242], fontStyle: 'bold', halign: 'center', lineWidth: 0.5 } },
           { content: 'Days', styles: { fillColor: [242, 242, 242], fontStyle: 'bold', halign: 'center', lineWidth: 0.5 } },
         ]);
       } else if (valA.startsWith("---") || valA.startsWith("--")) {
         const isMed = valA.toLowerCase().includes("medical");
         const fill = isMed ? [198, 224, 180] : [248, 203, 173];
-        const text = isMed ? "-- Medical --" : "-- Surgical --";
+        const text = isMed ? "-- RAHUL MEDICAL & SURGICAL --" : "-- RAHUL SURGICALS --";
         body.push([{ content: text, colSpan: 6, styles: { fillColor: fill, fontStyle: 'bold', halign: 'center', lineWidth: 0.5, minCellHeight: 14 } }]);
       } else if (valA.startsWith("Outstanding Summary")) {
         body.push([{ content: valA, colSpan: 6, styles: { fillColor: [68, 114, 196], textColor: [255, 255, 255], fontStyle: 'bold', halign: 'center', lineWidth: 0.5, minCellHeight: 16 } }]);
@@ -702,8 +704,8 @@ const App = () => {
     const colStyles = {
       0: { cellWidth: 95, halign: 'center' },   // Bill (e.g. *RM-4498)
       1: { cellWidth: 80, halign: 'center' },   // Date (e.g. 06-03-26)
-      2: { cellWidth: 95, halign: 'right' },    // Debit
-      3: { cellWidth: 85, halign: 'right' },    // Credit
+      2: { cellWidth: 95, halign: 'right' },    // Amount
+      3: { cellWidth: 85, halign: 'right' },    // Deposit
       4: { cellWidth: 105, halign: 'right' },   // Balance
       5: { cellWidth: 85.28, halign: 'center' }, // Days
     };
@@ -985,8 +987,8 @@ def style_excel_file(filename):
     column_widths = {
         'A': 20, # Bill No
         'B': 14, # Date
-        'C': 16, # Debit
-        'D': 14, # Credit
+        'C': 16, # Amount
+        'D': 14, # Deposit
         'E': 16, # Balance
         'F': 12, # Days
     }
@@ -1001,7 +1003,7 @@ if os.path.exists(FILE_1): process_file(FILE_1, combined_data, 'file1')
 if os.path.exists(FILE_2): process_file(FILE_2, combined_data, 'file2')
 
 final_output_rows = []
-transaction_header = ["Bill", "Date", "Debit", "Credit", "Balance", "Days"]
+transaction_header = ["Bill", "Date", "Amount", "Deposit", "Balance", "Days"]
 
 for key, data in combined_data.items():
     header_row = [f"{data['original_name']}  ({data['city']})", "", "", "", "", data['total_combined']]
@@ -1009,14 +1011,14 @@ for key, data in combined_data.items():
     final_output_rows.append(transaction_header)
 
     if data['transactions_file1']:
-        final_output_rows.append(["--- Medical ---", "", "", "", "", ""])
+        final_output_rows.append(["--- RAHUL MEDICAL & SURGICAL ---", "", "", "", "", ""])
         for trans in data['transactions_file1']:
             padded = list(trans)
             while len(padded) < 6: padded.append("")
             final_output_rows.append(padded[:6])
 
     if data['transactions_file2']:
-        final_output_rows.append(["--- Surgical ---", "", "", "", "", ""])
+        final_output_rows.append(["--- RAHUL SURGICALS ---", "", "", "", "", ""])
         for trans in data['transactions_file2']:
             padded = list(trans)
             while len(padded) < 6: padded.append("")
